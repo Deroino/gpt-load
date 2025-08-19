@@ -40,6 +40,13 @@ type SystemSettings struct {
 	KeyValidationConcurrency     int `json:"key_validation_concurrency" default:"10" name:"密钥验证并发数" category:"密钥配置" desc:"后台定时验证无效 Key 时的并发数，如果使用SQLite或者运行环境性能不佳，请尽量保证20以下，避免过高的并发导致数据不一致问题。" validate:"required,min=1"`
 	KeyValidationTimeoutSeconds  int `json:"key_validation_timeout_seconds" default:"20" name:"密钥验证超时（秒）" category:"密钥配置" desc:"后台定时验证单个 Key 时的 API 请求超时时间（秒）。" validate:"required,min=1"`
 
+	// 智能重试配置
+	EnableAdvancedRetry          bool `json:"enable_advanced_retry" default:"true" name:"启用智能重试" category:"智能重试" desc:"启用空响应、内容屏蔽、异常结束等高级重试检测机制。" validate:""`
+	EnableContextRetry           bool `json:"enable_context_retry" default:"true" name:"启用上下文保持重试" category:"智能重试" desc:"重试时保持已生成内容的上下文，避免重复生成。" validate:""`
+	EnableCompletionCheck        bool `json:"enable_completion_check" default:"true" name:"启用完整性验证" category:"智能重试" desc:"通过注入完整性标记来验证响应是否完整。" validate:""`
+	EnablePunctuationHeuristic   bool `json:"enable_punctuation_heuristic" default:"false" name:"启用标点符号启发式" category:"智能重试" desc:"当连续重试都以句号等结尾时，视为可能完成的响应。" validate:""`
+	MaxAccumulatedChars          int  `json:"max_accumulated_chars" default:"65535" name:"最大累积字符数" category:"智能重试" desc:"单次对话中允许累积的最大字符数，防止上下文过长。" validate:"required,min=1000"`
+
 	// For cache
 	ProxyKeysMap map[string]struct{} `json:"-"`
 }
