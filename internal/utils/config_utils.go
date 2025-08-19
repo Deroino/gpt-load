@@ -53,7 +53,7 @@ func GenerateSettingsMetadata(s *types.SystemSettings) []models.SystemSettingInf
 			Key:          jsonTag,
 			Name:         nameTag,
 			Value:        fieldValue.Interface(),
-			Type:         field.Type.String(),
+			Type:         mapGoTypeToAPIType(field.Type.String()),
 			DefaultValue: defaultTag,
 			Description:  descTag,
 			Category:     categoryTag,
@@ -63,6 +63,20 @@ func GenerateSettingsMetadata(s *types.SystemSettings) []models.SystemSettingInf
 		settingsInfo = append(settingsInfo, info)
 	}
 	return settingsInfo
+}
+
+// mapGoTypeToAPIType maps Go types to frontend-compatible types
+func mapGoTypeToAPIType(goType string) string {
+	switch goType {
+	case "int":
+		return "int"
+	case "bool":
+		return "bool"
+	case "string":
+		return "string"
+	default:
+		return "string"
+	}
 }
 
 // DefaultSystemSettings 返回默认的系统配置
