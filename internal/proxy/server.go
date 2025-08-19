@@ -50,6 +50,14 @@ func NewProxyServer(
 	}, nil
 }
 
+// isEmptyResponse checks if the response body indicates an empty AI response
+func isEmptyResponse(body []byte) bool {
+	// Check for common patterns indicating empty responses across different AI providers
+	return bytes.Contains(body, []byte(`"completion_tokens":0`)) ||
+		bytes.Contains(body, []byte(`"candidatesTokenCount":0`)) ||
+		bytes.Contains(body, []byte(`"output_tokens":0`))
+}
+
 // HandleProxy is the main entry point for proxy requests, refactored based on the stable .bak logic.
 func (ps *ProxyServer) HandleProxy(c *gin.Context) {
 	startTime := time.Now()
@@ -215,6 +223,33 @@ func (ps *ProxyServer) executeRequestWithRetry(
 
 		ps.executeRequestWithRetry(c, channelHandler, group, bodyBytes, isStream, startTime, retryCount+1)
 		return
+	}
+
+	// Check for empty response before considering it successful
+	if !isStream {
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			logrus.Errorf("Failed to read response body for empty check: %v", err)
+		} else {
+			resp.Body.Close()
+			resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			
+			if isEmptyResponse(bodyBytes) {
+				logrus.Debugf("Empty response detected for key %s on attempt %d/%d. Triggering retry.", utils.MaskAPIKey(apiKey.KeyValue), retryCount+1, cfg.MaxRetries)
+				ps.keyProvider.UpdateStatus(apiKey, group, false)
+				
+				newRetryErrors := append(retryErrors, types.RetryError{
+					StatusCode:         500,
+					ErrorMessage:       "Empty response detected (completion_tokens: 0)",
+					ParsedErrorMessage: "AI service returned empty content",
+					KeyValue:           apiKey.KeyValue,
+					Attempt:            retryCount + 1,
+					UpstreamAddr:       upstreamURL,
+				})
+				ps.executeRequestWithRetry(c, channelHandler, group, bodyBytes, isStream, startTime, retryCount+1, newRetryErrors)
+				return
+			}
+		}
 	}
 
 	// ps.keyProvider.UpdateStatus(apiKey, group, true) // 请求成功不再重置成功次数，减少IO消耗
