@@ -83,6 +83,54 @@ func (rv *ResponseValidator) ValidateResponse(body []byte, provider string, isSt
 	return ValidationResult{IsValid: true}
 }
 
+// ValidateStreamResponse performs validation for streaming responses
+func (rv *ResponseValidator) ValidateStreamResponse(body []byte, provider string) ValidationResult {
+	bodyStr := string(body)
+
+	// Heuristic for stream completion. Currently focused on OpenAI's `[DONE]` marker.
+	// This can be extended for other providers.
+	isDone := strings.Contains(bodyStr, "data: [DONE]")
+
+	// Check if there is any actual content in the stream
+	hasContent := rv.hasNonEmptyStreamContent(body, provider)
+
+	if !hasContent {
+		logrus.Debug("Stream validation failed: No content found.")
+		return ValidationResult{
+			IsValid:      false,
+			ErrorType:    "EMPTY_RESPONSE",
+			ErrorMessage: "Stream response contained no meaningful content.",
+			ShouldRetry:  true,
+		}
+	}
+
+	if !isDone {
+		logrus.Debug("Stream validation failed: Stream ended prematurely without [DONE] marker.")
+		return ValidationResult{
+			IsValid:      false,
+			ErrorType:    "INCOMPLETE_STREAM",
+			ErrorMessage: "Stream ended prematurely without the [DONE] marker.",
+			ShouldRetry:  true,
+		}
+	}
+
+	return ValidationResult{IsValid: true}
+}
+
+// hasNonEmptyStreamContent checks if a stream response has content besides control messages.
+func (rv *ResponseValidator) hasNonEmptyStreamContent(body []byte, provider string) bool {
+	lines := strings.Split(string(body), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "data:") {
+			content := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if content != "" && content != "[DONE]" {
+				return true // Found a data line with actual content
+			}
+		}
+	}
+	return false
+}
+
 // isEmptyResponse checks if the response indicates empty AI content
 func (rv *ResponseValidator) isEmptyResponse(body []byte) bool {
 	// Check for common patterns indicating empty responses across different AI providers
