@@ -30,9 +30,9 @@ func NewResponseValidator() *ResponseValidator {
 
 // ValidateResponse performs comprehensive validation of AI service responses
 func (rv *ResponseValidator) ValidateResponse(body []byte, provider string, isStream bool) ValidationResult {
-	// Skip validation for streaming responses for now
+	// For streaming responses, use specialized validation
 	if isStream {
-		return ValidationResult{IsValid: true}
+		return rv.ValidateStreamResponse(body, provider)
 	}
 
 	// Check for empty response
@@ -83,9 +83,65 @@ func (rv *ResponseValidator) ValidateResponse(body []byte, provider string, isSt
 	return ValidationResult{IsValid: true}
 }
 
+// ValidateResponseWithConfig performs validation with configurable strictness
+func (rv *ResponseValidator) ValidateResponseWithConfig(body []byte, provider string, isStream bool, enableStrictDetection bool) ValidationResult {
+	// Basic validation first
+	result := rv.ValidateResponse(body, provider, isStream)
+	if !result.IsValid {
+		return result
+	}
+	
+	// Additional strict validation if enabled
+	if enableStrictDetection && !isStream {
+		// Check for additional edge cases only in strict mode
+		if rv.isWhitespaceOnlyResponse(body) {
+			logrus.Debug("Strict validation: whitespace-only response detected")
+			return ValidationResult{
+				IsValid:      false,
+				ErrorType:    "WHITESPACE_ONLY_RESPONSE",
+				ErrorMessage: "Response contains only whitespace characters",
+				ShouldRetry:  true,
+			}
+		}
+		
+		if rv.isPunctuationOnlyResponse(body) {
+			logrus.Debug("Strict validation: punctuation-only response detected")
+			return ValidationResult{
+				IsValid:      false,
+				ErrorType:    "PUNCTUATION_ONLY_RESPONSE",
+				ErrorMessage: "Response contains only punctuation characters",
+				ShouldRetry:  true,
+			}
+		}
+		
+		if rv.isSuspiciouslyShortResponse(body) {
+			logrus.Debug("Strict validation: suspiciously short response detected")
+			return ValidationResult{
+				IsValid:      false,
+				ErrorType:    "SUSPICIOUSLY_SHORT_RESPONSE",
+				ErrorMessage: "Response is suspiciously short and may be incomplete",
+				ShouldRetry:  true,
+			}
+		}
+	}
+	
+	return ValidationResult{IsValid: true}
+}
+
 // ValidateStreamResponse performs validation for streaming responses
 func (rv *ResponseValidator) ValidateStreamResponse(body []byte, provider string) ValidationResult {
 	bodyStr := string(body)
+	
+	// Check for empty stream response first
+	if rv.isEmptyStreamResponse(body, provider) {
+		logrus.Debug("Empty stream response detected during validation")
+		return ValidationResult{
+			IsValid:      false,
+			ErrorType:    "EMPTY_STREAM_RESPONSE",
+			ErrorMessage: "Stream response contained no meaningful content or returned empty tokens",
+			ShouldRetry:  true,
+		}
+	}
 
 	// Heuristic for stream completion. Currently focused on OpenAI's `[DONE]` marker.
 	// This can be extended for other providers.
@@ -131,6 +187,128 @@ func (rv *ResponseValidator) hasNonEmptyStreamContent(body []byte, provider stri
 	return false
 }
 
+// isEmptyStreamResponse checks if the stream response indicates empty AI content
+func (rv *ResponseValidator) isEmptyStreamResponse(body []byte, provider string) bool {
+	bodyStr := string(body)
+	lines := strings.Split(bodyStr, "\n")
+	
+	// Check for token count patterns in stream data
+	for _, line := range lines {
+		if strings.HasPrefix(line, "data:") {
+			content := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if content != "" && content != "[DONE]" {
+				// Parse each streaming JSON chunk
+				var chunk map[string]interface{}
+				if err := json.Unmarshal([]byte(content), &chunk); err == nil {
+					// Check for usage information indicating empty content
+					if usage, ok := chunk["usage"].(map[string]interface{}); ok {
+						// OpenAI format: completion_tokens: 0
+						if tokens, tokensOk := usage["completion_tokens"]; tokensOk {
+							if tokenCount, isFloat := tokens.(float64); isFloat && tokenCount == 0 {
+								logrus.Debug("Empty stream response detected: completion_tokens = 0")
+								return true
+							}
+						}
+						// Gemini format: candidatesTokenCount: 0
+						if tokens, tokensOk := usage["candidatesTokenCount"]; tokensOk {
+							if tokenCount, isFloat := tokens.(float64); isFloat && tokenCount == 0 {
+								logrus.Debug("Empty stream response detected: candidatesTokenCount = 0")
+								return true
+							}
+						}
+						// Anthropic format: output_tokens: 0
+						if tokens, tokensOk := usage["output_tokens"]; tokensOk {
+							if tokenCount, isFloat := tokens.(float64); isFloat && tokenCount == 0 {
+								logrus.Debug("Empty stream response detected: output_tokens = 0")
+								return true
+							}
+						}
+					}
+					
+					// Check for empty content in choices
+					if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
+						if choice, ok := choices[0].(map[string]interface{}); ok {
+							if delta, ok := choice["delta"].(map[string]interface{}); ok {
+								if content, ok := delta["content"]; ok && content == nil {
+									// Check if this is the final chunk with empty content
+									if reason, ok := choice["finish_reason"].(string); ok && reason == "stop" {
+										logrus.Debug("Empty stream response detected: final chunk with nil content")
+										return true
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	// Additional pattern check for complete empty streams
+	hasAnyContent := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "data:") {
+			content := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if content != "" && content != "[DONE]" {
+				var chunk map[string]interface{}
+				if err := json.Unmarshal([]byte(content), &chunk); err == nil {
+					if rv.hasContentInStreamChunk(chunk) {
+						hasAnyContent = true
+						break
+					}
+				}
+			}
+		}
+	}
+	
+	if !hasAnyContent && strings.Contains(bodyStr, "[DONE]") {
+		logrus.Debug("Empty stream response detected: no content found in any chunks")
+		return true
+	}
+	
+	return false
+}
+
+// hasContentInStreamChunk checks if a stream chunk contains actual content
+func (rv *ResponseValidator) hasContentInStreamChunk(chunk map[string]interface{}) bool {
+	// OpenAI format
+	if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]interface{}); ok {
+			if delta, ok := choice["delta"].(map[string]interface{}); ok {
+				if content, ok := delta["content"].(string); ok && strings.TrimSpace(content) != "" {
+					return true
+				}
+			}
+		}
+	}
+	
+	// Gemini format
+	if candidates, ok := chunk["candidates"].([]interface{}); ok && len(candidates) > 0 {
+		if candidate, ok := candidates[0].(map[string]interface{}); ok {
+			if content, ok := candidate["content"].(map[string]interface{}); ok {
+				if parts, ok := content["parts"].([]interface{}); ok {
+					for _, part := range parts {
+						if partMap, ok := part.(map[string]interface{}); ok {
+							if text, ok := partMap["text"].(string); ok && strings.TrimSpace(text) != "" {
+								return true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	// Anthropic format
+	if delta, ok := chunk["delta"].(map[string]interface{}); ok {
+		if text, ok := delta["text"].(string); ok && strings.TrimSpace(text) != "" {
+			return true
+		}
+	}
+	
+	return false
+}
+
 // isEmptyResponse checks if the response indicates empty AI content
 func (rv *ResponseValidator) isEmptyResponse(body []byte) bool {
 	// Check for common patterns indicating empty responses across different AI providers
@@ -149,8 +327,13 @@ func (rv *ResponseValidator) isEmptyResponse(body []byte) bool {
 	if bytes.Contains(body, []byte(`"output_tokens":0`)) {
 		return true
 	}
+	
+	// Additional pattern: "completion_tokens": null
+	if bytes.Contains(body, []byte(`"completion_tokens":null`)) {
+		return true
+	}
 
-	// Additional check: parse JSON and look for empty content
+	// Parse JSON and look for empty content
 	var response map[string]interface{}
 	if err := json.Unmarshal(body, &response); err == nil {
 		if rv.hasEmptyContent(response) {
@@ -159,6 +342,117 @@ func (rv *ResponseValidator) isEmptyResponse(body []byte) bool {
 	}
 
 	return false
+}
+
+// isWhitespaceOnlyResponse checks if response content is only whitespace
+func (rv *ResponseValidator) isWhitespaceOnlyResponse(body []byte) bool {
+	var response map[string]interface{}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return false
+	}
+	
+	text := rv.extractResponseTextForValidation(response)
+	if text != "" && strings.TrimSpace(text) == "" {
+		logrus.Debug("Empty response detected: content is only whitespace")
+		return true
+	}
+	
+	return false
+}
+
+// isPunctuationOnlyResponse checks if response content is only punctuation
+func (rv *ResponseValidator) isPunctuationOnlyResponse(body []byte) bool {
+	var response map[string]interface{}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return false
+	}
+	
+	text := strings.TrimSpace(rv.extractResponseTextForValidation(response))
+	if text == "" {
+		return false
+	}
+	
+	// Check if text contains only punctuation and whitespace
+	hasLetter := false
+	for _, r := range text {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || 
+		   (r >= '0' && r <= '9') || (r >= 0x4e00 && r <= 0x9fff) { // Include Chinese characters
+			hasLetter = true
+			break
+		}
+	}
+	
+	if !hasLetter && len(text) <= 3 { // Only punctuation and very short
+		logrus.Debugf("Empty response detected: content is only punctuation: %s", text)
+		return true
+	}
+	
+	return false
+}
+
+// isSuspiciouslyShortResponse checks if response is suspiciously short (likely incomplete)
+func (rv *ResponseValidator) isSuspiciouslyShortResponse(body []byte) bool {
+	var response map[string]interface{}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return false
+	}
+	
+	text := strings.TrimSpace(rv.extractResponseTextForValidation(response))
+	if text == "" {
+		return false
+	}
+	
+	// Check for finish_reason "stop" but very short content (possible truncation)
+	hasStopReason := rv.hasStopFinishReason(response)
+	if hasStopReason && len([]rune(text)) <= 2 { // Very short content with stop reason
+		logrus.Debugf("Empty response detected: suspiciously short content with stop reason: %s", text)
+		return true
+	}
+	
+	return false
+}
+
+// hasStopFinishReason checks if the response has a stop finish reason
+func (rv *ResponseValidator) hasStopFinishReason(response map[string]interface{}) bool {
+	// OpenAI format
+	if choices, ok := response["choices"].([]interface{}); ok && len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]interface{}); ok {
+			if reason, ok := choice["finish_reason"].(string); ok && reason == "stop" {
+				return true
+			}
+		}
+	}
+	
+	// Gemini format
+	if candidates, ok := response["candidates"].([]interface{}); ok && len(candidates) > 0 {
+		if candidate, ok := candidates[0].(map[string]interface{}); ok {
+			if reason, ok := candidate["finishReason"].(string); ok && reason == "STOP" {
+				return true
+			}
+		}
+	}
+	
+	// Anthropic format
+	if reason, ok := response["stop_reason"].(string); ok && reason == "end_turn" {
+		return true
+	}
+	
+	return false
+}
+
+// extractResponseTextForValidation extracts text content from response for validation
+func (rv *ResponseValidator) extractResponseTextForValidation(response map[string]interface{}) string {
+	// Try different formats
+	if text := rv.extractOpenAIText(response); text != "" {
+		return text
+	}
+	if text := rv.extractGeminiText(response); text != "" {
+		return text
+	}
+	if text := rv.extractAnthropicText(response); text != "" {
+		return text
+	}
+	return ""
 }
 
 // isBlockedResponse checks if content was blocked by safety filters
