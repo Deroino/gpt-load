@@ -216,7 +216,7 @@ func (ps *ProxyServer) executeRequestWithRetry(
 			return
 		}
 
-		ps.keyProvider.UpdateStatus(apiKey, group, false)
+		ps.keyProvider.UpdateStatus(apiKey, group, false, "")
 
 		var statusCode int
 		var errorMessage string
@@ -266,16 +266,29 @@ func (ps *ProxyServer) executeRequestWithRetry(
 			cfg := ps.settingsManager.GetSettings()
 			
 			if cfg.EnableAdvancedRetry {
-				validationResult := ps.responseValidator.ValidateResponse(bodyBytes, group.ChannelType, isStream)
+				validationResult := ps.responseValidator.ValidateResponseWithConfig(bodyBytes, group.ChannelType, isStream, cfg.EnableStrictEmptyDetection)
 				
 				if !validationResult.IsValid && validationResult.ShouldRetry {
+					// Enhanced logging for debugging empty response detection
+					logrus.WithFields(logrus.Fields{
+						"group":        group.Name,
+						"channel_type": group.ChannelType,
+						"key":          utils.MaskAPIKey(apiKey.KeyValue),
+						"attempt":      retryCount + 1,
+						"max_retries":  cfg.MaxRetries,
+						"error_type":   validationResult.ErrorType,
+						"is_stream":    isStream,
+						"body_length":  len(bodyBytes),
+					}).Debugf("Response validation failed: %s. Response preview: %.200s", 
+						validationResult.ErrorMessage, string(bodyBytes))
+					
 					// Check punctuation heuristic before retrying
 					if ps.responseValidator.CheckPunctuationHeuristic(bodyBytes, group.ChannelType, cfg.EnablePunctuationHeuristic) {
 						logrus.Debug("Punctuation heuristic override: treating response as complete despite validation failure")
 					} else {
 						logrus.Debugf("%s detected for key %s on attempt %d/%d. Triggering retry.", 
 							validationResult.ErrorType, utils.MaskAPIKey(apiKey.KeyValue), retryCount+1, cfg.MaxRetries)
-						ps.keyProvider.UpdateStatus(apiKey, group, false)
+						ps.keyProvider.UpdateStatus(apiKey, group, false, "")
 						
 						// Extract accumulated text from current response (if context retry enabled)
 						var newAccumulatedText string
@@ -344,10 +357,19 @@ func (ps *ProxyServer) executeRequestWithRetry(
 		validationResult, responseBody := ps.handleStreamingResponse(c, resp, group, &cfg)
 
 		if cfg.EnableAdvancedRetry && !validationResult.IsValid && validationResult.ShouldRetry {
-			logrus.Debugf("Stream validation failed for key %s on attempt %d/%d. Error: %s. Triggering retry.",
-				utils.MaskAPIKey(apiKey.KeyValue), retryCount+1, group.EffectiveConfig.MaxRetries, validationResult.ErrorMessage)
+			// Enhanced logging for debugging stream validation failures
+			logrus.WithFields(logrus.Fields{
+				"group":              group.Name,
+				"channel_type":       group.ChannelType,
+				"key":                utils.MaskAPIKey(apiKey.KeyValue),
+				"attempt":            retryCount + 1,
+				"max_retries":        group.EffectiveConfig.MaxRetries,
+				"error_type":         validationResult.ErrorType,
+				"response_body_size": len(responseBody),
+			}).Debugf("Stream validation failed: %s. Stream body preview: %.200s",
+				validationResult.ErrorMessage, string(responseBody))
 
-			ps.keyProvider.UpdateStatus(apiKey, group, false)
+			ps.keyProvider.UpdateStatus(apiKey, group, false, "")
 
 			newRetryErrors := append(retryErrors, types.RetryError{
 				StatusCode:         500, // Internal error for validation failure
@@ -400,7 +422,6 @@ func (ps *ProxyServer) logRequest(
 		RequestPath:  utils.TruncateString(c.Request.URL.String(), 500),
 		Duration:     duration,
 		UserAgent:    c.Request.UserAgent(),
-		Retries:      retries,
 		IsStream:     isStream,
 		UpstreamAddr: utils.TruncateString(upstreamAddr, 500),
 	}
