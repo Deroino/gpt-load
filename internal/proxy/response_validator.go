@@ -84,7 +84,12 @@ func (rv *ResponseValidator) ValidateResponse(body []byte, provider string, isSt
 }
 
 // ValidateResponseWithConfig performs validation with configurable strictness
-func (rv *ResponseValidator) ValidateResponseWithConfig(body []byte, provider string, isStream bool, enableStrictDetection bool) ValidationResult {
+func (rv *ResponseValidator) ValidateResponseWithConfig(body []byte, provider string, isStream bool, enableStrictDetection bool, enableCompletionCheck bool) ValidationResult {
+	// For streaming responses, use specialized validation with completion check config
+	if isStream {
+		return rv.ValidateStreamResponseWithConfig(body, provider, enableCompletionCheck)
+	}
+	
 	// Basic validation first
 	result := rv.ValidateResponse(body, provider, isStream)
 	if !result.IsValid {
@@ -125,6 +130,20 @@ func (rv *ResponseValidator) ValidateResponseWithConfig(body []byte, provider st
 		}
 	}
 	
+	// Additional completion token validation for non-stream responses if enabled
+	if enableCompletionCheck && !isStream {
+		hasCompletionToken := strings.Contains(string(body), "[done]")
+		if !hasCompletionToken {
+			logrus.Debug("Response validation failed: Missing completion token [done]")
+			return ValidationResult{
+				IsValid:      false,
+				ErrorType:    "MISSING_COMPLETION_TOKEN",
+				ErrorMessage: "Response is missing the required completion token [done]",
+				ShouldRetry:  true,
+			}
+		}
+	}
+	
 	return ValidationResult{IsValid: true}
 }
 
@@ -143,9 +162,8 @@ func (rv *ResponseValidator) ValidateStreamResponse(body []byte, provider string
 		}
 	}
 
-	// Heuristic for stream completion. Currently focused on OpenAI's `[DONE]` marker.
-	// This can be extended for other providers.
-	isDone := strings.Contains(bodyStr, "data: [DONE]")
+	// Check for OpenAI/standard SSE completion marker
+	hasSSEDone := strings.Contains(bodyStr, "data: [DONE]")
 
 	// Check if there is any actual content in the stream
 	hasContent := rv.hasNonEmptyStreamContent(body, provider)
@@ -160,7 +178,8 @@ func (rv *ResponseValidator) ValidateStreamResponse(body []byte, provider string
 		}
 	}
 
-	if !isDone {
+	// Stream is incomplete if it doesn't have proper completion markers
+	if !hasSSEDone {
 		logrus.Debug("Stream validation failed: Stream ended prematurely without [DONE] marker.")
 		return ValidationResult{
 			IsValid:      false,
@@ -170,6 +189,33 @@ func (rv *ResponseValidator) ValidateStreamResponse(body []byte, provider string
 		}
 	}
 
+	return ValidationResult{IsValid: true}
+}
+
+// ValidateStreamResponseWithConfig performs validation with completion check configuration
+func (rv *ResponseValidator) ValidateStreamResponseWithConfig(body []byte, provider string, enableCompletionCheck bool) ValidationResult {
+	// Basic stream validation first
+	result := rv.ValidateStreamResponse(body, provider)
+	if !result.IsValid {
+		return result
+	}
+	
+	// Additional completion token validation if enabled
+	if enableCompletionCheck {
+		bodyStr := string(body)
+		hasCompletionToken := strings.Contains(bodyStr, "[done]")
+		
+		if !hasCompletionToken {
+			logrus.Debug("Stream validation failed: Missing custom completion token [done] in content.")
+			return ValidationResult{
+				IsValid:      false,
+				ErrorType:    "MISSING_COMPLETION_TOKEN",
+				ErrorMessage: "Stream response is missing the required completion token [done].",
+				ShouldRetry:  true,
+			}
+		}
+	}
+	
 	return ValidationResult{IsValid: true}
 }
 

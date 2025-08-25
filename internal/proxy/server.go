@@ -266,7 +266,7 @@ func (ps *ProxyServer) executeRequestWithRetry(
 			cfg := ps.settingsManager.GetSettings()
 			
 			if cfg.EnableAdvancedRetry {
-				validationResult := ps.responseValidator.ValidateResponseWithConfig(bodyBytes, group.ChannelType, isStream, cfg.EnableStrictEmptyDetection)
+				validationResult := ps.responseValidator.ValidateResponseWithConfig(bodyBytes, group.ChannelType, isStream, cfg.EnableStrictEmptyDetection, cfg.EnableCompletionCheck)
 				
 				if !validationResult.IsValid && validationResult.ShouldRetry {
 					// Enhanced logging for debugging empty response detection

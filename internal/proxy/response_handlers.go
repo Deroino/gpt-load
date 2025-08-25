@@ -32,47 +32,60 @@ func (ps *ProxyServer) handleStreamingResponse(c *gin.Context, resp *http.Respon
 		return ValidationResult{IsValid: true}, body
 	}
 
+	// Buffer the entire stream first for validation
 	var accumulatedBody bytes.Buffer
-	teeReader := io.TeeReader(resp.Body, &accumulatedBody)
 	buf := make([]byte, 4*1024)
-	var streamErr error
-
+	
 	for {
-		n, err := teeReader.Read(buf)
+		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			if _, writeErr := c.Writer.Write(buf[:n]); writeErr != nil {
-				logUpstreamError("writing stream to client", writeErr)
-				streamErr = writeErr
-				break
-			}
-			flusher.Flush()
+			accumulatedBody.Write(buf[:n])
 		}
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			logUpstreamError("reading from upstream", err)
-			streamErr = err
-			break
+			return ValidationResult{
+				IsValid:      false,
+				ErrorType:    "STREAM_ERROR",
+				ErrorMessage: err.Error(),
+				ShouldRetry:  true,
+			}, accumulatedBody.Bytes()
 		}
 	}
 
-	if streamErr != nil {
-		return ValidationResult{
-			IsValid:      false,
-			ErrorType:    "STREAM_ERROR",
-			ErrorMessage: streamErr.Error(),
-			ShouldRetry:  true,
-		}, accumulatedBody.Bytes()
-	}
-
 	finalBody := accumulatedBody.Bytes()
+	
+	// Validate the complete stream if enabled
+	var validationResult ValidationResult
 	if cfg.EnableAdvancedRetry {
-		validationResult := ps.responseValidator.ValidateStreamResponse(finalBody, group.ChannelType)
-		return validationResult, finalBody
+		validationResult = ps.responseValidator.ValidateStreamResponseWithConfig(finalBody, group.ChannelType, cfg.EnableCompletionCheck)
+	} else {
+		validationResult = ValidationResult{IsValid: true}
 	}
-
-	return ValidationResult{IsValid: true}, finalBody
+	
+	// If validation passed, clean the response and send to client
+	if validationResult.IsValid {
+		cleanedBody := finalBody
+		if cfg.EnableCompletionCheck {
+			cleanedBody = ps.promptInjector.RemoveCompletionToken(finalBody, group.ChannelType)
+		}
+		
+		// Write cleaned stream to client
+		if _, err := c.Writer.Write(cleanedBody); err != nil {
+			logUpstreamError("writing cleaned stream to client", err)
+			return ValidationResult{
+				IsValid:      false,
+				ErrorType:    "STREAM_WRITE_ERROR",
+				ErrorMessage: err.Error(),
+				ShouldRetry:  false, // Don't retry write errors
+			}, finalBody
+		}
+		flusher.Flush()
+	}
+	
+	return validationResult, finalBody
 }
 
 func (ps *ProxyServer) handleNormalResponse(c *gin.Context, resp *http.Response, groupType string) {
